@@ -1,5 +1,5 @@
 /**
- * PM Bot Platform - Minimal Detailed Guest UI Upgrade
+ * CM Bot Platform - Optimized Worker (每条消息均发送访客资料卡)
  * * 修复说明：
  * 之前的验证 Key 是 `verified-{uid}` (全局共享)。
  * 现在改为 `verified-{routeId}-{uid}` (每个机器人独立)。
@@ -40,7 +40,51 @@ export default {
 // --- 配置区域 ---
 const NOTIFY_INTERVAL = 3600 * 1000; 
 const fraudDbUrl = 'https://raw.githubusercontent.com/LloydAsp/nfd/main/data/fraud.db';
-const DEFAULT_TTL = 30 * 24 * 60 * 60; 
+const DEFAULT_TTL = 30 * 24 * 60 * 60;
+
+// KV 是最终一致性存储。下面的内存缓存用于同一 Worker isolate 内快速命中；
+// 它是加速层，不是持久化层，也不能保证跨地区强一致。
+const verifiedMemory = new Map();
+const pendingVerifyMemory = new Map();
+let fraudDbMemory = { value: null, expiresAt: 0 };
+const MEMORY_CACHE_MAX = 5000;
+
+function memorySet(map, key, value) {
+  if (map.size >= MEMORY_CACHE_MAX && !map.has(key)) {
+    const firstKey = map.keys().next().value;
+    if (firstKey !== undefined) map.delete(firstKey);
+  }
+  map.set(key, value);
+}
+
+function verifiedKey(routeId, uid) {
+  return `verified-${routeId}-${uid}`;
+}
+
+async function isGuestVerified(env, routeId, uid) {
+  const key = verifiedKey(routeId, uid);
+  const now = Date.now();
+  const cached = verifiedMemory.get(key);
+  if (cached && cached.expiresAt > now) return true;
+  if (cached) verifiedMemory.delete(key);
+
+  // 将 KV 默认边缘缓存时间明确设为 30 秒，避免默认 60 秒负缓存窗口。
+  // 注意：这仍不能消除 KV 跨地区写入传播延迟。
+  const value = await env.PMBOT.get(key, { cacheTtl: 30 });
+  const verified = value === 'true' || value === '1';
+  if (verified) memorySet(verifiedMemory, key, { expiresAt: now + 5 * 60 * 1000 });
+  return verified;
+}
+
+async function getFraudDatabase() {
+  const now = Date.now();
+  if (fraudDbMemory.value && fraudDbMemory.expiresAt > now) return fraudDbMemory.value;
+  const response = await fetch(fraudDbUrl, { cf: { cacheTtl: 3600, cacheEverything: true } });
+  if (!response.ok) throw new Error(`Fraud database HTTP ${response.status}`);
+  const value = await response.text();
+  fraudDbMemory = { value, expiresAt: now + 60 * 60 * 1000 };
+  return value;
+}
 
 // --- [文案配置] 子机器人管理员使用教程 ---
 const OWNER_HELP_TEXT = `
@@ -444,10 +488,16 @@ async function handleMainBotWebhook(request, env, ctx) {
 // ==================================================
 
 async function handleManagedBotWebhook(request, env, ctx, routeId) {
-  const configStr = await env.PMBOT.get(`platform:route:${routeId}`);
+  if (!routeId || !/^[A-Za-z0-9-]{8,80}$/.test(routeId)) {
+    return new Response('Invalid route', { status: 400 });
+  }
+
+  const configStr = await env.PMBOT.get(`platform:route:${routeId}`, { cacheTtl: 30 });
   if (!configStr) return new Response('Bot not found', { status: 404 });
-  
-  let config = JSON.parse(configStr);
+
+  let config;
+  try { config = JSON.parse(configStr); }
+  catch { return new Response('Invalid bot config', { status: 500 }); }
   if (typeof config.enable_verify === 'undefined') config.enable_verify = true;
   if (config.secret && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== config.secret) {
     return new Response('Unauthorized', { status: 403 });
@@ -456,98 +506,89 @@ async function handleManagedBotWebhook(request, env, ctx, routeId) {
 
   const update = await request.json();
   const TOKEN = config.token;
-  const OWNER_ID = config.owner_id.toString();
+  const OWNER_ID = String(config.owner_id);
 
   // --- 处理回调查询 ---
   if (update.callback_query) {
     const cq = update.callback_query;
-    const data = cq.data;
-    const chatId = cq.message.chat.id;
-
-    if (chatId.toString() !== OWNER_ID) {
-        await answerCallbackQuery(TOKEN, cq.id, "无权操作", true);
-        return new Response('Ok');
+    const data = cq.data || '';
+    const chatId = cq.message?.chat?.id;
+    if (String(chatId) !== OWNER_ID) {
+      await answerCallbackQuery(TOKEN, cq.id, '无权操作', true);
+      return new Response('Ok');
     }
 
     if (data.startsWith('block_')) {
-        const targetId = data.split('_')[1];
-        await env.PMBOT.put(`isblocked-${routeId}-${targetId}`, true);
-        await answerCallbackQuery(TOKEN, cq.id, `🚫 用户 ${targetId} 已屏蔽`, true);
+      const targetId = data.slice('block_'.length);
+      await env.PMBOT.put(`isblocked-${routeId}-${targetId}`, 'true');
+      await answerCallbackQuery(TOKEN, cq.id, `🚫 用户 ${targetId} 已屏蔽`, true);
+    } else if (data.startsWith('unblock_')) {
+      const targetId = data.slice('unblock_'.length);
+      await env.PMBOT.delete(`isblocked-${routeId}-${targetId}`);
+      await answerCallbackQuery(TOKEN, cq.id, `✅ 用户 ${targetId} 已解封`, true);
+    } else if (data === 'reply_placeholder') {
+      await answerCallbackQuery(TOKEN, cq.id);
     }
-    else if (data.startsWith('unblock_')) {
-        const targetId = data.split('_')[1];
-        await env.PMBOT.put(`isblocked-${routeId}-${targetId}`, false);
-        await answerCallbackQuery(TOKEN, cq.id, `✅ 用户 ${targetId} 已解封`, true);
-    }
-    else if (data === 'reply_placeholder') {
-        await answerCallbackQuery(TOKEN, cq.id);
-    }
-    
     return new Response('Ok');
   }
 
-  // --- 处理普通消息 ---
   if (!update.message) return new Response('Ok');
   const msg = update.message;
   const chatId = msg.chat.id;
+  const chatIdText = String(chatId);
   const text = msg.text || '';
 
   // === A. 机器人管理员 (Bot Owner) ===
-  if (chatId.toString() === OWNER_ID) {
-    // 回复消息逻辑
+  if (chatIdText === OWNER_ID) {
     if (msg.reply_to_message) {
-      const mappingKey = `msg-map-${msg.reply_to_message.message_id}`;
-      const guestChatId = await env.PMBOT.get(mappingKey, { type: "json" });
+      // 新映射按 routeId 隔离；同时回退读取旧版全局 Key，兼容已存在的回复记录。
+      const newMappingKey = `msg-map-${routeId}-${msg.reply_to_message.message_id}`;
+      const oldMappingKey = `msg-map-${msg.reply_to_message.message_id}`;
+      const guestChatId = await env.PMBOT.get(newMappingKey) || await env.PMBOT.get(oldMappingKey);
 
       if (guestChatId) {
         if (text.startsWith('/block')) {
-           await env.PMBOT.put(`isblocked-${routeId}-${guestChatId}`, true);
-           await sendMessage(TOKEN, OWNER_ID, `🚫 已屏蔽用户 ${guestChatId}`);
-           return new Response('Ok');
+          await env.PMBOT.put(`isblocked-${routeId}-${guestChatId}`, 'true');
+          await sendMessage(TOKEN, OWNER_ID, `🚫 已屏蔽用户 ${guestChatId}`);
+          return new Response('Ok');
         }
         if (text.startsWith('/unblock')) {
-           await env.PMBOT.put(`isblocked-${routeId}-${guestChatId}`, false);
-           await sendMessage(TOKEN, OWNER_ID, `✅ 已解除屏蔽 ${guestChatId}`);
-           return new Response('Ok');
+          await env.PMBOT.delete(`isblocked-${routeId}-${guestChatId}`);
+          await sendMessage(TOKEN, OWNER_ID, `✅ 已解除屏蔽 ${guestChatId}`);
+          return new Response('Ok');
         }
-
         await copyMessage(TOKEN, guestChatId, chatId, msg.message_id);
         return new Response('Ok');
       }
     }
-    
-    // 使用教程
+
     if (text === '/start') {
-        await sendMessage(TOKEN, chatId, OWNER_HELP_TEXT, { parse_mode: 'Markdown' });
-        // [静默修复] 每次管理员 /start 时，尝试设置一次菜单，确保旧机器人也有菜单
-        ctx.waitUntil(setBotCommands(TOKEN));
+      await sendMessage(TOKEN, chatId, OWNER_HELP_TEXT, { parse_mode: 'Markdown' });
+      // 菜单命令不需要阻塞管理员响应。
+      ctx.waitUntil(setBotCommands(TOKEN).catch(() => {}));
     }
     return new Response('Ok');
   }
 
   // === B. 普通访客 (Guest) ===
-  const guestKey = `platform:guest:${routeId}:${chatId}`;
-  const guestRecord = await env.PMBOT.get(guestKey, { type: 'json' }) || {
-    routeId, guest_id: chatId, first_name: msg.from.first_name || '',
-    last_name: msg.from.last_name || '', username: msg.from.username || '',
-    first_seen: Date.now(), messages: 0
-  };
-  guestRecord.last_seen = Date.now();
-  guestRecord.messages = (guestRecord.messages || 0) + 1;
-  await env.PMBOT.put(guestKey, JSON.stringify(guestRecord));
-
-  const isBlocked = (await env.PMBOT.get(`isblocked-${routeId}-${chatId}`, { type: "json" })) || (await env.PMBOT.get(`isblocked-${chatId}`, { type: "json" }));
+  // 屏蔽状态并行读取。KV 值统一按字符串处理，兼容旧版 true/false 值。
+  const [routeBlocked, legacyBlocked] = await Promise.all([
+    env.PMBOT.get(`isblocked-${routeId}-${chatIdText}`, { cacheTtl: 30 }),
+    env.PMBOT.get(`isblocked-${chatIdText}`, { cacheTtl: 30 })
+  ]);
+  const isBlocked = [routeBlocked, legacyBlocked].some(v => v === 'true' || v === '1');
   if (isBlocked) {
     await sendMessage(TOKEN, chatId, '🚫 **您已被管理员屏蔽**', { parse_mode: 'Markdown' });
     return new Response('Ok');
   }
 
+  // /start 仍展示欢迎语，不将 /start 当作验证成功，也不转发给管理员。
   if (text === '/start') {
     const statsKey = `stats:${routeId}:users`;
     ctx.waitUntil((async () => {
-        let count = await env.PMBOT.get(statsKey) || 0;
-        await env.PMBOT.put(statsKey, parseInt(count) + 1);
-    })());
+      const count = Number(await env.PMBOT.get(statsKey) || 0);
+      await env.PMBOT.put(statsKey, String(count + 1));
+    })().catch(() => {}));
 
     const welcome = config.welcome_msg || `
 👋 **您好！这里是私聊机器人**
@@ -561,55 +602,105 @@ async function handleManagedBotWebhook(request, env, ctx, routeId) {
     return new Response('Ok');
   }
 
+  // 验证状态先查 isolate 内存，再查 KV。验证成功后会立即写入本 isolate 缓存。
   if (config.enable_verify) {
-      // [Fix] 验证状态 Key 增加 routeId 前缀，实现多机器人隔离
-      const isVerified = await env.PMBOT.get(`verified-${routeId}-${chatId}`, { type: "json" });
-      
-      if (!isVerified) {
-        const workerOrigin = new URL(request.url).origin;
-        const firstName = msg.from.first_name || 'User';
-        const username = msg.from.username ? `(@${msg.from.username})` : '';
-        const verifyNonce = uuidv4();
-        await env.PMBOT.put(`verify:nonce:${verifyNonce}`, JSON.stringify({ uid: String(chatId), routeId }), { expirationTtl: 600 });
-        const verifyLink = `${workerOrigin}/verify?uid=${chatId}&routeId=${routeId}&nonce=${verifyNonce}&name=${encodeURIComponent(firstName)}&user=${encodeURIComponent(username)}`;
-
-        await sendMessage(TOKEN, chatId, '🛡 <b>安全验证 (Security Check)</b>\n\n为了防止垃圾信息，请点击下方按钮进行验证。\nPlease verify you are human to continue.', {
-            parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [[ { text: "🤖 点击验证 (Verify)", web_app: { url: verifyLink } } ]]
-            }
-        });
-        return new Response('Ok');
+    const isVerified = await isGuestVerified(env, routeId, chatIdText);
+    if (!isVerified) {
+      const pendingKey = `verify:pending:${routeId}:${chatIdText}`;
+      const localPending = pendingVerifyMemory.get(pendingKey);
+      let pending = localPending && localPending.expiresAt > Date.now() ? localPending : null;
+      if (!pending) {
+        const pendingRaw = await env.PMBOT.get(pendingKey, { cacheTtl: 30 });
+        if (pendingRaw) {
+          try { pending = JSON.parse(pendingRaw); } catch {}
+        }
       }
+
+      // 已有未过期验证链接时复用同一个 nonce；45 秒内不重复发送验证消息。
+      let createdPending = false;
+      if (!pending || !pending.nonce || !pending.verifyLink || pending.expiresAt <= Date.now()) {
+        const workerOrigin = new URL(request.url).origin;
+        const firstName = msg.from?.first_name || 'User';
+        const username = msg.from?.username ? `(@${msg.from.username})` : '';
+        const verifyNonce = uuidv4();
+        const expiresAt = Date.now() + 10 * 60 * 1000;
+        const verifyLink = `${workerOrigin}/verify?uid=${encodeURIComponent(chatIdText)}&routeId=${encodeURIComponent(routeId)}&nonce=${encodeURIComponent(verifyNonce)}&name=${encodeURIComponent(firstName)}&user=${encodeURIComponent(username)}`;
+        pending = { nonce: verifyNonce, verifyLink, expiresAt, lastSentAt: 0 };
+        await env.PMBOT.put(`verify:nonce:${verifyNonce}`, JSON.stringify({ uid: chatIdText, routeId }), { expirationTtl: 600 });
+        createdPending = true;
+      }
+
+      const shouldSendChallenge = createdPending || !pending.lastSentAt || (Date.now() - pending.lastSentAt > 45 * 1000);
+      if (shouldSendChallenge) {
+        pending.lastSentAt = Date.now();
+        await env.PMBOT.put(pendingKey, JSON.stringify(pending), { expirationTtl: 600 });
+        memorySet(pendingVerifyMemory, pendingKey, pending);
+        await sendMessage(TOKEN, chatId, '🛡 <b>安全验证 (Security Check)</b>\n\n为了防止垃圾信息，请点击下方框体验证。\nPlease verify you are human to continue.', {
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [[{ text: '🤖 点击验证 (Verify)', web_app: { url: pending.verifyLink } }]]
+          }
+        });
+      }
+      return new Response('Ok');
+    }
   }
 
-  // 原始消息保持原样转发；访客资料与管理按钮放在独立资料卡中。
-  // 这样管理员既能阅读完整内容，也能在资料卡中查看信息和执行管理操作。
+  // 只有通过验证的普通消息才更新访客资料和转发。
+  const guestKey = `platform:guest:${routeId}:${chatIdText}`;
+  let guestRecord = await env.PMBOT.get(guestKey, { type: 'json', cacheTtl: 30 });
+  const now = Date.now();
+  if (!guestRecord) {
+    guestRecord = {
+      routeId,
+      guest_id: chatId,
+      first_name: msg.from?.first_name || '',
+      last_name: msg.from?.last_name || '',
+      username: msg.from?.username || '',
+      first_seen: now,
+      messages: 0
+    };
+  }
+  guestRecord.first_name = msg.from?.first_name || guestRecord.first_name || '';
+  guestRecord.last_name = msg.from?.last_name || guestRecord.last_name || '';
+  guestRecord.username = msg.from?.username || guestRecord.username || '';
+  guestRecord.last_seen = now;
+  guestRecord.messages = Number(guestRecord.messages || 0) + 1;
+  // 访客资料写入放到后台，不阻塞消息转发；该计数在并发消息下属于近似统计。
+  ctx.waitUntil(env.PMBOT.put(guestKey, JSON.stringify(guestRecord)).catch(() => {}));
+
   const copyResp = await copyMessage(TOKEN, OWNER_ID, chatId, msg.message_id);
+  if (!copyResp || !copyResp.ok || !copyResp.result?.message_id) return new Response('Ok');
 
-  if (copyResp.ok) {
-    const statsKey = `stats:${routeId}:msgs`;
-    ctx.waitUntil((async () => {
-        let count = await env.PMBOT.get(statsKey) || 0;
-        await env.PMBOT.put(statsKey, parseInt(count) + 1);
-    })());
+  const statsKey = `stats:${routeId}:msgs`;
+  ctx.waitUntil((async () => {
+    const count = Number(await env.PMBOT.get(statsKey) || 0);
+    await env.PMBOT.put(statsKey, String(count + 1));
+  })().catch(() => {}));
 
-    // 保留原始转发消息的映射，管理员直接回复原始消息仍会发回对应访客。
-    const mappingTtl = 60 * 60 * 48;
-    const mappingKey = `msg-map-${copyResp.result.message_id}`;
-    await env.PMBOT.put(mappingKey, String(chatId), { expirationTtl: mappingTtl });
+  // 消息映射增加 routeId，避免不同托管机器人产生相同 message_id 时串线。
+  // 同时写入旧 Key，便于旧版流程/数据过渡。
+  const mappingTtl = 60 * 60 * 48;
+  const mappingValue = String(chatId);
+  await Promise.all([
+    env.PMBOT.put(`msg-map-${routeId}-${copyResp.result.message_id}`, mappingValue, { expirationTtl: mappingTtl }),
+    env.PMBOT.put(`msg-map-${copyResp.result.message_id}`, mappingValue, { expirationTtl: mappingTtl })
+  ]);
 
-    // 生成独立、详细的访客资料卡。
-    const userDisplayName = `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim() || '访客';
-    const usernameText = msg.from.username ? `@${escapeHtml(msg.from.username)}` : '未设置';
-    const firstSeenText = new Date(guestRecord.first_seen || Date.now()).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    const lastSeenText = new Date(guestRecord.last_seen || Date.now()).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  // 每条访客消息都发送一张独立资料卡，方便管理员逐条查看和回复。
+  // 资料卡发送放在 waitUntil 后台执行，不阻塞 Telegram Webhook 对消息的确认。
+  // 每张资料卡都写入独立消息映射，因此回复任意一张卡片都会发回同一访客。
+  ctx.waitUntil((async () => {
+    const userDisplayName = `${msg.from?.first_name || ''} ${msg.from?.last_name || ''}`.trim() || '访客';
+    const usernameText = msg.from?.username ? `@${escapeHtml(msg.from.username)}` : '未设置';
+    const firstSeenText = new Date(guestRecord.first_seen || now).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    const lastSeenText = new Date(guestRecord.last_seen || now).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
     const guestCardText =
       `👤 <b>访客资料</b>\n` +
       `━━━━━━━━━━━━━━\n` +
       `<b>昵称：</b>${escapeHtml(userDisplayName)}\n` +
       `<b>用户名：</b>${usernameText}\n` +
-      `<b>Telegram UID：</b><code>${escapeHtml(chatId)}</code>\n` +
+      `<b>Telegram UID：</b><code>${escapeHtml(chatIdText)}</code>\n` +
       `<b>累计消息：</b>${Number(guestRecord.messages || 0)} 条\n` +
       `<b>首次联系：</b>${escapeHtml(firstSeenText)}\n` +
       `<b>最近联系：</b>${escapeHtml(lastSeenText)}\n` +
@@ -622,30 +713,29 @@ async function handleManagedBotWebhook(request, env, ctx, routeId) {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '👤 查看 Telegram 资料', url: `tg://user?id=${chatId}` },
-            { text: '🆔 复制 UID', copy_text: { text: String(chatId) } }
+            { text: '👤 查看 Telegram 资料', url: `tg://user?id=${chatIdText}` },
+            { text: '🆔 复制 UID', copy_text: { text: chatIdText } }
           ],
           [
-            { text: '🚫 屏蔽访客', callback_data: `block_${chatId}` },
-            { text: '✅ 解封访客', callback_data: `unblock_${chatId}` }
+            { text: '🚫 屏蔽访客', callback_data: `block_${chatIdText}` },
+            { text: '✅ 解封访客', callback_data: `unblock_${chatIdText}` }
           ]
         ]
       }
     });
 
-    // 资料卡本身也建立相同映射，因此回复资料卡同样可以正常转发给访客。
-    if (guestCardResp && guestCardResp.ok && guestCardResp.result && guestCardResp.result.message_id) {
-      await env.PMBOT.put(
-        `msg-map-${guestCardResp.result.message_id}`,
-        String(chatId),
-        { expirationTtl: mappingTtl }
-      );
+    if (guestCardResp?.ok && guestCardResp.result?.message_id) {
+      await Promise.all([
+        env.PMBOT.put(`msg-map-${routeId}-${guestCardResp.result.message_id}`, mappingValue, { expirationTtl: mappingTtl }),
+        env.PMBOT.put(`msg-map-${guestCardResp.result.message_id}`, mappingValue, { expirationTtl: mappingTtl })
+      ]);
     }
+  })().catch(() => {}));
 
-    if (await isFraud(chatId)) {
-        await sendMessage(TOKEN, OWNER_ID, `⚠️ **警报**：检测到发送者 UID ${chatId} 在诈骗黑名单中！`, { parse_mode: 'Markdown' });
-    }
-  }
+  // 诈骗库检查放在后台，并在 isolate 内缓存一小时，不再每条消息重新下载数据库。
+  ctx.waitUntil(isFraud(chatId).then(async result => {
+    if (result) await sendMessage(TOKEN, OWNER_ID, `⚠️ **警报**：检测到发送者 UID ${chatId} 在诈骗黑名单中！`, { parse_mode: 'Markdown' });
+  }).catch(() => {}));
 
   return new Response('Ok');
 }
@@ -921,62 +1011,90 @@ function handleVerifyPage(url, env) {
 }
 
 async function handleVerifySubmit(request, env) {
-  const formData = await request.formData();
+  const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+
+  let formData;
+  try { formData = await request.formData(); }
+  catch { return jsonResponse({ success: false, error: 'invalid_form' }, 400); }
+
   const token = formData.get('cf-turnstile-response');
-  const uid = formData.get('uid');
-  const routeId = formData.get('routeId');
-  const nonce = formData.get('nonce');
+  const uid = String(formData.get('uid') || '');
+  const routeId = String(formData.get('routeId') || '');
+  const nonce = String(formData.get('nonce') || '');
   const ip = request.headers.get('CF-Connecting-IP');
   const SECRET_KEY = env.ENV_TURNSTILE_SECRET_KEY;
 
-  if (!token || !uid || !routeId || !nonce) return new Response(JSON.stringify({ success: false }), { headers: { 'Content-Type': 'application/json' } });
+  if (!token || !uid || !routeId || !nonce || !SECRET_KEY) {
+    return jsonResponse({ success: false, error: 'missing_fields' }, 400);
+  }
+
   const nonceKey = `verify:nonce:${nonce}`;
-  const nonceRecord = await env.PMBOT.get(nonceKey, { type: 'json' });
-  if (!nonceRecord || String(nonceRecord.uid) !== String(uid) || nonceRecord.routeId !== routeId) {
-    return new Response(JSON.stringify({ success: false }), { headers: { 'Content-Type': 'application/json' } });
+  const nonceRecord = await env.PMBOT.get(nonceKey, { type: 'json', cacheTtl: 30 });
+  if (!nonceRecord || String(nonceRecord.uid) !== uid || String(nonceRecord.routeId) !== routeId) {
+    return jsonResponse({ success: false, error: 'invalid_or_expired_nonce' }, 403);
   }
-  const routeConfigRaw = await env.PMBOT.get(`platform:route:${routeId}`);
-  if (!routeConfigRaw) return new Response(JSON.stringify({ success: false }), { headers: { 'Content-Type': 'application/json' } });
 
-  const tr = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ secret: SECRET_KEY, response: token, remoteip: ip })
-  }).then(r => r.json());
+  const routeConfigRaw = await env.PMBOT.get(`platform:route:${routeId}`, { cacheTtl: 30 });
+  if (!routeConfigRaw) return jsonResponse({ success: false, error: 'route_not_found' }, 404);
 
-  if (tr.success) {
-    await env.PMBOT.delete(nonceKey);
-    let ttl = DEFAULT_TTL;
-    let tokenToSend = null;
-
-    if (routeId) {
-        const platformSettings = await env.PMBOT.get('platform:settings', { type: 'json' });
-        if (platformSettings && platformSettings.verify_ttl) {
-            ttl = platformSettings.verify_ttl;
-        }
-
-        const configStr = await env.PMBOT.get(`platform:route:${routeId}`);
-        if (configStr) {
-            const config = JSON.parse(configStr);
-            tokenToSend = config.token;
-        }
-        
-        // [Fix] 使用带 routeId 的 Key，实现隔离验证
-        await env.PMBOT.put(`verified-${routeId}-${uid}`, "true", { expirationTtl: ttl });
-    } else {
-        // [Fallback] 如果没有 routeId (理论上不应发生)，使用旧 Key 格式
-        await env.PMBOT.put(`verified-${uid}`, "true", { expirationTtl: ttl });
-    }
-    
-    if (tokenToSend) {
-        // [保持优化] 提示用户稍等
-        await sendMessage(tokenToSend, uid, '✅ **验证成功！**\n\n系统正在同步数据，请稍等 **5秒** 后再发送消息。\n_(若消息发送失败，请等待几秒后重试)_', { parse_mode: 'Markdown' });
-    }
-
-    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-  } else {
-    return new Response(JSON.stringify({ success: false }), { headers: { 'Content-Type': 'application/json' } });
+  let turnstileResult;
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        secret: SECRET_KEY,
+        response: String(token),
+        ...(ip ? { remoteip: ip } : {})
+      })
+    });
+    turnstileResult = await response.json();
+  } catch {
+    return jsonResponse({ success: false, error: 'turnstile_unavailable' }, 502);
   }
+
+  if (!turnstileResult?.success) {
+    return jsonResponse({ success: false, error: 'turnstile_failed' }, 403);
+  }
+
+  let ttl = DEFAULT_TTL;
+  let tokenToSend = null;
+  try {
+    const [platformSettings, routeConfig] = await Promise.all([
+      env.PMBOT.get('platform:settings', { type: 'json', cacheTtl: 30 }),
+      Promise.resolve(JSON.parse(routeConfigRaw))
+    ]);
+    if (platformSettings && Number(platformSettings.verify_ttl) > 0) {
+      ttl = Math.min(Number(platformSettings.verify_ttl), 365 * 24 * 60 * 60);
+    }
+    tokenToSend = routeConfig.token || null;
+  } catch {
+    // 配置读取失败时保留默认 30 天 TTL；验证本身已经由 Turnstile 确认成功。
+  }
+
+  const verifiedKey = verifiedKeyForSubmit(routeId, uid);
+  // 先写持久化 KV，再更新本 isolate 内存缓存。
+  await env.PMBOT.put(verifiedKey, 'true', { expirationTtl: ttl });
+  memorySet(verifiedMemory, verifiedKey, { expiresAt: Date.now() + Math.min(ttl, 5 * 60) * 1000 });
+  await Promise.all([
+    env.PMBOT.delete(nonceKey),
+    env.PMBOT.delete(`verify:pending:${routeId}:${uid}`)
+  ]);
+  pendingVerifyMemory.delete(`verify:pending:${routeId}:${uid}`);
+
+  if (tokenToSend) {
+    // 验证状态已保存；无需再提示用户等待 KV 同步 5 秒。
+    await sendMessage(tokenToSend, uid, '✅ **验证成功！**\n\n验证已完成，现在可以直接继续发送消息。', { parse_mode: 'Markdown' }).catch(() => {});
+  }
+
+  return jsonResponse({ success: true });
+}
+
+function verifiedKeyForSubmit(routeId, uid) {
+  return `verified-${routeId}-${uid}`;
 }
 
 // 5. 注册主 Webhook
@@ -988,7 +1106,9 @@ async function registerMainWebhook(request, url, env) {
 
 async function isFraud(id) {
   try {
-    const db = await fetch(fraudDbUrl).then(r => r.text());
-    return db.includes(id.toString());
-  } catch { return false; }
+    const db = await getFraudDatabase();
+    return db.includes(String(id));
+  } catch {
+    return false;
+  }
 }
